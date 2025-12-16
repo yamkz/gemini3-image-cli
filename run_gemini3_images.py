@@ -84,9 +84,11 @@ def collect_images(images_dir: Path, max_images: int | None = None) -> list[Path
     return paths
 
 
-def normalize_and_dedupe(paths: list[Path]) -> list[Path]:
-    # Deduplicate by resolved absolute path, keep first occurrence order,
-    # then return stable sorted by path string for repeatable behavior.
+def normalize_and_dedupe_sorted(paths: list[Path]) -> list[Path]:
+    """
+    Deduplicate by resolved absolute path, then return stable sorted by path string
+    for repeatable behavior.
+    """
     seen: set[str] = set()
     uniq: list[Path] = []
     for p in paths:
@@ -95,6 +97,49 @@ def normalize_and_dedupe(paths: list[Path]) -> list[Path]:
             seen.add(rp)
             uniq.append(Path(rp))
     return sorted(uniq, key=lambda x: str(x))
+
+
+def normalize_and_dedupe_keep_first(paths: list[Path]) -> list[Path]:
+    """
+    Deduplicate by resolved absolute path and keep first occurrence order.
+    (No global sort; used to preserve grouping such as NORMAL -> STYLE.)
+    """
+    seen: set[str] = set()
+    uniq: list[Path] = []
+    for p in paths:
+        rp = str(p.expanduser().resolve())
+        if rp not in seen:
+            seen.add(rp)
+            uniq.append(Path(rp))
+    return uniq
+
+
+def collect_mixed_style_inputs(style_args: list[list[str]] | None) -> list[Path]:
+    """
+    Collect style image paths from a flexible --style input.
+    Each --style occurrence can accept multiple paths, and each path can be a file or directory.
+    Directories are searched recursively for images (stable sorted by path).
+    """
+    out: list[Path] = []
+    if not style_args:
+        return out
+    for group in style_args:
+        for raw in group:
+            p = Path(raw).expanduser()
+            if not p.exists():
+                _eprint(f"style が存在しません: {p}")
+                raise FileNotFoundError(str(p))
+            if p.is_dir():
+                out.extend(collect_images(p, max_images=None))
+            elif p.is_file():
+                if p.suffix.lower() not in IMAGE_EXTS_DEFAULT:
+                    _eprint(f"style は画像ファイルではありません（拡張子が未対応）: {p}")
+                    raise ValueError(str(p))
+                out.append(p)
+            else:
+                _eprint(f"style が不正です（ファイル/フォルダではありません）: {p}")
+                raise ValueError(str(p))
+    return out
 
 
 def build_parts(prompt: str, image_paths: list[Path]) -> list[dict]:
@@ -137,6 +182,13 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=None,
         help="フォルダから拾う最大枚数（大量画像の安全策）",
+    )
+    p.add_argument(
+        "--style",
+        action="append",
+        nargs="+",
+        default=[],
+        help="スタイル指定（ファイル/フォルダ混在OK、複数回指定可、例: --style a.jpg /path/to/style_dir b.png）",
     )
     p.add_argument("--candidate_count", type=int, default=1, help="生成する画像の枚数（candidateCount）")
     p.add_argument("--seed", type=int, default=None, help="seed（未指定なら送らない）")
@@ -355,7 +407,44 @@ def main() -> int:
             return 2
         image_paths.append(p)
 
-    image_paths = normalize_and_dedupe(image_paths)
+    # NORMAL images: keep current stable behavior (dedupe + sorted by path).
+    normal_paths = normalize_and_dedupe_sorted(image_paths)
+
+    # STYLE images: collect from flexible --style (file/dir/mixed), then dedupe + sorted.
+    try:
+        style_raw = collect_mixed_style_inputs(args.style)
+    except FileNotFoundError:
+        return 2
+    except ValueError:
+        return 2
+    style_paths = normalize_and_dedupe_sorted(style_raw)
+
+    # Cap style images to 10 (warn + truncate).
+    if len(style_paths) > 10:
+        _eprint(f"警告: style 画像が多すぎます（{len(style_paths)}枚）。先頭10枚のみ使用します。")
+        style_paths = style_paths[:10]
+
+    # Final attachment order: NORMAL -> STYLE, dedup across both while preserving the order.
+    all_image_paths = normalize_and_dedupe_keep_first(normal_paths + style_paths)
+
+    # If style is provided, append a style-following instruction at the end of the prompt.
+    prompt_final = args.prompt
+    if style_paths:
+        # Build index map from resolved absolute path -> 1-based image number in the final attachments.
+        index_map: dict[str, int] = {}
+        for i, p in enumerate(all_image_paths, start=1):
+            index_map[str(p.expanduser().resolve())] = i
+        style_numbers: list[int] = []
+        for sp in style_paths:
+            n = index_map.get(str(sp.expanduser().resolve()))
+            if n is not None:
+                style_numbers.append(n)
+        if style_numbers:
+            block_lines = [
+                "# **追加指示: これらの画像の絵柄/スタイルに忠実に従った画像を生成してください**",
+                *[f"- image{n}" for n in style_numbers],
+            ]
+            prompt_final = (prompt_final.rstrip() + "\n\n" + "\n".join(block_lines)).rstrip() + "\n"
 
     started = time.time()
 
@@ -373,7 +462,7 @@ def main() -> int:
         if seed_override is not None:
             gc["seed"] = seed_override
         base_payload = {
-            "contents": [{"parts": build_parts(args.prompt, image_paths)}],
+            "contents": [{"parts": build_parts(prompt_final, all_image_paths)}],
             "generationConfig": gc,
         }
 

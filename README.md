@@ -45,6 +45,41 @@ python run_gemini3_images.py \
   --candidate_count 1
 ```
 
+### スタイル画像で「絵柄/タッチ」を指定する（--style）
+
+`--style` に画像（ファイル）やフォルダを渡すと、**絵柄/スタイルの参照画像**としてリクエストに添付されます。
+
+- **フォルダ/単体/混在OK**（`--style` は複数回指定できます）
+- **添付順は「通常の入力画像 → スタイル画像」**で固定されます
+- スタイル画像がある場合、プロンプトの末尾に自動で以下が追加されます（番号は添付順と一致）：
+
+```text
+# **追加指示: これらの画像の絵柄/スタイルに忠実に従った画像を生成してください**
+- imageX
+- imageY
+```
+
+例：
+
+```bash
+python run_gemini3_images.py \
+  --prompt "サウナはなぜ気持ちいいのか図解してください" \
+  --style "/path/to/style_images" \
+  --candidate_count 1
+```
+
+フォルダ＋単体の混在例：
+
+```bash
+python run_gemini3_images.py \
+  --prompt "添付画像の雰囲気を維持して新しい図を作って" \
+  --images_dir "/path/to/reference_images" \
+  --style "/path/to/style_images" "/path/to/extra_style.jpg" \
+  --candidate_count 1
+```
+
+※ スタイル画像は最大10枚です。11枚以上ある場合は **警告を出して先頭10枚のみ**使用します。
+
 ### 複数枚生成（candidateCount）
 
 ```bash
