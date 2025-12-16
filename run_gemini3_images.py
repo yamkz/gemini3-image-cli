@@ -142,6 +142,34 @@ def collect_mixed_style_inputs(style_args: list[list[str]] | None) -> list[Path]
     return out
 
 
+def collect_mixed_object_inputs(object_args: list[list[str]] | None) -> list[Path]:
+    """
+    Collect object image paths from a flexible --object input.
+    Each --object occurrence can accept multiple paths, and each path can be a file or directory.
+    Directories are searched recursively for images (stable sorted by path).
+    """
+    out: list[Path] = []
+    if not object_args:
+        return out
+    for group in object_args:
+        for raw in group:
+            p = Path(raw).expanduser()
+            if not p.exists():
+                _eprint(f"object が存在しません: {p}")
+                raise FileNotFoundError(str(p))
+            if p.is_dir():
+                out.extend(collect_images(p, max_images=None))
+            elif p.is_file():
+                if p.suffix.lower() not in IMAGE_EXTS_DEFAULT:
+                    _eprint(f"object は画像ファイルではありません（拡張子が未対応）: {p}")
+                    raise ValueError(str(p))
+                out.append(p)
+            else:
+                _eprint(f"object が不正です（ファイル/フォルダではありません）: {p}")
+                raise ValueError(str(p))
+    return out
+
+
 def build_parts(prompt: str, image_paths: list[Path]) -> list[dict]:
     parts: list[dict] = [{"text": prompt}]
     for p in image_paths:
@@ -190,7 +218,19 @@ def parse_args() -> argparse.Namespace:
         default=[],
         help="スタイル指定（ファイル/フォルダ混在OK、複数回指定可、例: --style a.jpg /path/to/style_dir b.png）",
     )
+    p.add_argument(
+        "--object",
+        action="append",
+        nargs="+",
+        default=[],
+        help="オブジェクト指定（ファイル/フォルダ混在OK、複数回指定可、例: --object char.jpg /path/to/object_dir prop.png）",
+    )
     p.add_argument("--candidate_count", type=int, default=1, help="生成する画像の枚数（candidateCount）")
+    p.add_argument(
+        "--single_request",
+        action="store_true",
+        help="candidateCount を 1リクエストで送って複数枚生成する（モデルが未対応だと失敗します）。デフォルトは互換性のため 1枚×N回 です。",
+    )
     p.add_argument("--seed", type=int, default=None, help="seed（未指定なら送らない）")
     p.add_argument("--temperature", type=float, default=None, help="temperature（未指定なら送らない）")
     p.add_argument("--top_p", type=float, default=None, help="topP（未指定なら送らない）")
@@ -410,6 +450,20 @@ def main() -> int:
     # NORMAL images: keep current stable behavior (dedupe + sorted by path).
     normal_paths = normalize_and_dedupe_sorted(image_paths)
 
+    # OBJECT images: collect from flexible --object (file/dir/mixed), then dedupe + sorted.
+    try:
+        object_raw = collect_mixed_object_inputs(args.object)
+    except FileNotFoundError:
+        return 2
+    except ValueError:
+        return 2
+    object_paths = normalize_and_dedupe_sorted(object_raw)
+
+    # Cap object images to 10 (warn + truncate).
+    if len(object_paths) > 10:
+        _eprint(f"警告: object 画像が多すぎます（{len(object_paths)}枚）。先頭10枚のみ使用します。")
+        object_paths = object_paths[:10]
+
     # STYLE images: collect from flexible --style (file/dir/mixed), then dedupe + sorted.
     try:
         style_raw = collect_mixed_style_inputs(args.style)
@@ -424,27 +478,47 @@ def main() -> int:
         _eprint(f"警告: style 画像が多すぎます（{len(style_paths)}枚）。先頭10枚のみ使用します。")
         style_paths = style_paths[:10]
 
-    # Final attachment order: NORMAL -> STYLE, dedup across both while preserving the order.
-    all_image_paths = normalize_and_dedupe_keep_first(normal_paths + style_paths)
+    # Final attachment order: NORMAL -> OBJECT -> STYLE, dedup across all while preserving the order.
+    all_image_paths = normalize_and_dedupe_keep_first(normal_paths + object_paths + style_paths)
 
-    # If style is provided, append a style-following instruction at the end of the prompt.
+    # If object/style are provided, append additional instructions at the end of the prompt.
     prompt_final = args.prompt
-    if style_paths:
+    if object_paths or style_paths:
         # Build index map from resolved absolute path -> 1-based image number in the final attachments.
         index_map: dict[str, int] = {}
         for i, p in enumerate(all_image_paths, start=1):
             index_map[str(p.expanduser().resolve())] = i
-        style_numbers: list[int] = []
-        for sp in style_paths:
-            n = index_map.get(str(sp.expanduser().resolve()))
-            if n is not None:
-                style_numbers.append(n)
-        if style_numbers:
-            block_lines = [
-                "# **追加指示: これらの画像の絵柄/スタイルに忠実に従った画像を生成してください**",
-                *[f"- image{n}" for n in style_numbers],
-            ]
-            prompt_final = (prompt_final.rstrip() + "\n\n" + "\n".join(block_lines)).rstrip() + "\n"
+
+        blocks: list[str] = []
+
+        if object_paths:
+            object_numbers: list[int] = []
+            for op in object_paths:
+                n = index_map.get(str(op.expanduser().resolve()))
+                if n is not None:
+                    object_numbers.append(n)
+            if object_numbers:
+                obj_lines = [
+                    "# **追加指示: これらの画像に写っているキャラクター/物体/素材を、生成結果に必ず登場させてください（同一の存在として再現）**",
+                    *[f"- image{n}" for n in object_numbers],
+                ]
+                blocks.append("\n".join(obj_lines))
+
+        if style_paths:
+            style_numbers: list[int] = []
+            for sp in style_paths:
+                n = index_map.get(str(sp.expanduser().resolve()))
+                if n is not None:
+                    style_numbers.append(n)
+            if style_numbers:
+                style_lines = [
+                    "# **追加指示: これらの画像の絵柄/スタイルに忠実に従った画像を生成してください**",
+                    *[f"- image{n}" for n in style_numbers],
+                ]
+                blocks.append("\n".join(style_lines))
+
+        if blocks:
+            prompt_final = (prompt_final.rstrip() + "\n\n" + "\n\n".join(blocks)).rstrip() + "\n"
 
     started = time.time()
 
@@ -457,8 +531,10 @@ def main() -> int:
         Returns: (saved_count, elapsed_ms) or (None, error_info)
         """
         gc = build_generation_config(args)
-        # 1回のリクエストでは candidateCount は 1 に固定（複数候補が無効なモデルがあるため）
-        gc["candidateCount"] = 1
+        # デフォルトは互換性のため 1枚×N回（candidateCount>1 が無効なモデルがあるため）。
+        # 明示的に --single_request を付けた場合のみ、1リクエストで candidateCount を送る。
+        if not args.single_request:
+            gc["candidateCount"] = 1
         if seed_override is not None:
             gc["seed"] = seed_override
         base_payload = {
@@ -466,7 +542,12 @@ def main() -> int:
             "generationConfig": gc,
         }
 
-        _eprint(f"Requesting image generation... ({request_index}/{args.candidate_count}) model={args.model}")
+        if args.single_request:
+            _eprint(
+                f"Requesting image generation... (single_request, candidateCount={args.candidate_count}) model={args.model}"
+            )
+        else:
+            _eprint(f"Requesting image generation... ({request_index}/{args.candidate_count}) model={args.model}")
         t0 = time.time()
         resp_json, used_payload_or_err = try_generate(api_key=api_key, args=args, base_payload=base_payload)
         if resp_json is None:
@@ -498,33 +579,54 @@ def main() -> int:
 
         return saved_local, int((time.time() - t0) * 1000)
 
-    # candidate_count は「欲しい画像枚数」として扱い、必要なら複数回叩いて実現する。
     saved = 0
     per_request_ms: list[int] = []
-    for idx in range(1, args.candidate_count + 1):
-        seed_override = None
-        if args.seed is not None:
-            seed_override = args.seed + (idx - 1)
-        result = run_once(request_index=idx, seed_override=seed_override)
+    if args.single_request:
+        # 1リクエストで candidateCount を送る（成功すれば candidates が複数返る想定）。
+        result = run_once(request_index=1, seed_override=args.seed)
         if result[0] is None:
             err = result[1]
             _eprint("API呼び出しに失敗しました。")
             if not args.no_save_json:
-                (out_dir / f"error_{idx:02d}.json").write_text(
+                (out_dir / "error_01.json").write_text(
                     json.dumps(err, ensure_ascii=False, indent=2), encoding="utf-8"
                 )
-            _eprint("ヒント: まず --model を公式ドキュメントのモデル名に合わせてください。")
+            _eprint("ヒント: --single_request はモデルが candidateCount>1 に対応していないと失敗します。")
+            _eprint("対策: --single_request を外す（1枚×N回にフォールバック）か、対応モデルに変更してください。")
             _eprint(f"エラー詳細は {out_dir} を確認してください。")
             return 1
         saved_local, ms = result
         saved += saved_local
         per_request_ms.append(ms)
+        requests_made = 1
+    else:
+        # candidate_count は「欲しい画像枚数」として扱い、必要なら複数回叩いて実現する。
+        for idx in range(1, args.candidate_count + 1):
+            seed_override = None
+            if args.seed is not None:
+                seed_override = args.seed + (idx - 1)
+            result = run_once(request_index=idx, seed_override=seed_override)
+            if result[0] is None:
+                err = result[1]
+                _eprint("API呼び出しに失敗しました。")
+                if not args.no_save_json:
+                    (out_dir / f"error_{idx:02d}.json").write_text(
+                        json.dumps(err, ensure_ascii=False, indent=2), encoding="utf-8"
+                    )
+                _eprint("ヒント: まず --model を公式ドキュメントのモデル名に合わせてください。")
+                _eprint(f"エラー詳細は {out_dir} を確認してください。")
+                return 1
+            saved_local, ms = result
+            saved += saved_local
+            per_request_ms.append(ms)
+        requests_made = args.candidate_count
 
     elapsed_ms = int((time.time() - started) * 1000)
     meta = {
         "model": args.model,
         "candidateCountRequested": args.candidate_count,
-        "requestsMade": args.candidate_count,
+        "singleRequest": bool(args.single_request),
+        "requestsMade": requests_made,
         "savedImages": saved,
         "outputDir": str(out_dir),
         "elapsedMs": elapsed_ms,
